@@ -305,7 +305,6 @@ pub enum DispatcherImpl {
     Hash(HashDataDispatcher),
     Broadcast(BroadcastDispatcher),
     Simple(SimpleDispatcher),
-    RoundRobin(RoundRobinDataDispatcher),
 }
 
 macro_rules! impl_dispatcher {
@@ -356,8 +355,7 @@ macro_rules! for_all_dispatcher_variants {
             [$($x), *],
             { Hash },
             { Broadcast },
-            { Simple },
-            { RoundRobin }
+            { Simple }
         }
     };
 }
@@ -385,72 +383,6 @@ pub trait Dispatcher: Debug + 'static {
     fn remove_outputs(&mut self, actor_ids: &HashSet<ActorId>);
 
     fn get_dispatcher_id(&self) -> DispatcherId;
-}
-
-pub struct RoundRobinDataDispatcher {
-    outputs: Vec<BoxedOutput>,
-    cur: usize,
-    dispatcher_id: DispatcherId,
-}
-
-impl Debug for RoundRobinDataDispatcher {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RoundRobinDataDispatcher")
-            .field("outputs", &self.outputs)
-            .finish()
-    }
-}
-
-impl RoundRobinDataDispatcher {
-    pub fn new(outputs: Vec<BoxedOutput>, dispatcher_id: DispatcherId) -> Self {
-        Self {
-            outputs,
-            cur: 0,
-            dispatcher_id,
-        }
-    }
-}
-
-impl Dispatcher for RoundRobinDataDispatcher {
-    define_dispatcher_associated_types!();
-
-    fn dispatch_data(&mut self, chunk: StreamChunk) -> Self::DataFuture<'_> {
-        async move {
-            self.outputs[self.cur].send(Message::Chunk(chunk)).await?;
-            self.cur += 1;
-            self.cur %= self.outputs.len();
-            Ok(())
-        }
-    }
-
-    fn dispatch_barrier(&mut self, barrier: Barrier) -> Self::BarrierFuture<'_> {
-        async move {
-            // always broadcast barrier
-            for output in &mut self.outputs {
-                output.send(Message::Barrier(barrier.clone())).await?;
-            }
-            Ok(())
-        }
-    }
-
-    fn set_outputs(&mut self, outputs: impl IntoIterator<Item = BoxedOutput>) {
-        self.outputs = outputs.into_iter().collect();
-        self.cur = self.cur.min(self.outputs.len() - 1);
-    }
-
-    fn add_outputs(&mut self, outputs: impl IntoIterator<Item = BoxedOutput>) {
-        self.outputs.extend(outputs.into_iter());
-    }
-
-    fn remove_outputs(&mut self, actor_ids: &HashSet<ActorId>) {
-        self.outputs
-            .drain_filter(|output| actor_ids.contains(&output.actor_id()))
-            .count();
-    }
-
-    fn get_dispatcher_id(&self) -> DispatcherId {
-        self.dispatcher_id
-    }
 }
 
 pub struct HashDataDispatcher {

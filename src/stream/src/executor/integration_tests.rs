@@ -102,7 +102,7 @@ async fn test_merger_sum_aggr() {
         inputs.push(Box::new(LocalOutput::new(233, tx)) as Box<dyn Output>);
     }
 
-    // create a round robin dispatcher, which dispatches messages to the actors
+    // create a broadcast dispatcher, which dispatches messages to the actors
     let (mut input, rx) = channel(16);
     let schema = Schema {
         fields: vec![Field::unnamed(DataType::Int64)],
@@ -116,7 +116,7 @@ async fn test_merger_sum_aggr() {
     ));
     let dispatcher = DispatchExecutor::new(
         receiver_op,
-        vec![DispatcherImpl::RoundRobin(RoundRobinDataDispatcher::new(
+        vec![DispatcherImpl::Broadcast(BroadcastDispatcher::new(
             inputs, 0,
         ))],
         0,
