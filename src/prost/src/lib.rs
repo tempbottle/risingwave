@@ -43,7 +43,9 @@ pub mod user;
 #[rustfmt::skip]
 #[cfg_attr(madsim, path = "sim/source.rs")]
 pub mod source;
-
+#[rustfmt::skip]
+#[cfg_attr(madsim, path = "sim/scale_service.rs")]
+pub mod scale_service;
 
 #[rustfmt::skip]
 #[path = "catalog.serde.rs"]
@@ -87,7 +89,9 @@ pub mod user_serde;
 #[rustfmt::skip]
 #[path = "source.serde.rs"]
 pub mod source_serde;
-
+#[rustfmt::skip]
+#[path = "scale_service.serde.rs"]
+pub mod scale_service_serde;
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct ProstFieldNotFound(pub &'static str);

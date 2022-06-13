@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package scale_service;
+
+message PauseRequest {}
+
+message PauseResponse {}
+
+message ResumeRequest {}
+
+message ResumeResponse {}
+
+service ScaleService {
+  // TODO(Kexiang): delete them when config change interface is finished
+  rpc Pause(PauseRequest) returns (PauseResponse);
+  rpc Resume(ResumeRequest) returns (ResumeResponse);
+}
