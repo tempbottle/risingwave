@@ -83,3 +83,13 @@ steps:
       - shellcheck#v1.2.0:
           files: ./**/*.sh
     timeout_in_minutes: 5
+
+  - label: "docker build"
+    plugins:
+      - chronotc/monorepo-diff#v2.3.0:
+          watch:
+            - path: "docker/"
+              config:
+                command: "ci/scripts/docker.sh"
+                env:
+                  PUSH_GHCR: flase

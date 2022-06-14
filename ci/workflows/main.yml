@@ -127,3 +127,18 @@ steps:
             - GITHUB_TOKEN
             - BUILDKITE_TAG
     timeout_in_minutes: 5
+
+  - label: "docker build and push"
+    plugins:
+      - chronotc/monorepo-diff#v2.3.0:
+          watch:
+            - path: "docker/"
+              config:
+                command: "ci/scripts/docker.sh"
+                plugins:
+                  - seek-oss/aws-sm#v2.3.1:
+                      env:
+                        GHCR_USERNAME: ghcr-username
+                        GHCR_TOKEN: ghcr-token
+                env:
+                  - PUSH_GHCR: true
