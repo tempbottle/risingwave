@@ -14,28 +14,28 @@
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::prelude::{AsRawFd, FileExt, OpenOptionsExt, RawFd};
-use std::path::PathBuf;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use bytes::Buf;
+use bitvec::prelude::*;
+use bytes::{Buf, BufMut};
 use nix::fcntl::{fallocate, FallocateFlags};
 use nix::sys::stat::fstat;
 use nix::unistd::ftruncate;
 
 use super::error::{Error, Result};
-use super::{asyncify, DioBuffer, DIO_BUFFER_ALLOCATOR, LOGICAL_BLOCK_SIZE};
+use super::{asyncify, utils, DioBuffer, DIO_BUFFER_ALLOCATOR, LOGICAL_BLOCK_SIZE};
 
 const ST_BLOCK_SIZE: usize = 512;
+/// sst id (8) + block idx (4) + boffset (4) + len (4)
+const SLOT_INFO_SIZE: usize = 20;
 
 const MAGIC: &[u8] = b"hummock-cache-file";
 const VERSION: u32 = 1;
 
 #[derive(Clone, Debug)]
 pub struct CacheFileOptions {
-    pub dir: String,
-    pub id: u64,
-
     pub fs_block_size: usize,
     /// NOTE: `block_size` must be a multiple of `fs_block_size`.
     pub block_size: usize,
@@ -45,9 +45,9 @@ pub struct CacheFileOptions {
 
 impl CacheFileOptions {
     fn assert(&self) {
-        assert_pow2(LOGICAL_BLOCK_SIZE);
-        assert_alignment(LOGICAL_BLOCK_SIZE, self.fs_block_size);
-        assert_alignment(self.fs_block_size, self.block_size);
+        utils::usize::assert_pow2(LOGICAL_BLOCK_SIZE);
+        utils::usize::assert_aligned(LOGICAL_BLOCK_SIZE, self.fs_block_size);
+        utils::usize::assert_aligned(self.fs_block_size, self.block_size);
     }
 }
 
@@ -76,8 +76,7 @@ struct CacheFileCore {
 /// ```
 #[derive(Clone)]
 pub struct CacheFile {
-    dir: String,
-    id: u64,
+    id: u32,
 
     pub fs_block_size: usize,
     pub block_size: usize,
@@ -89,12 +88,7 @@ pub struct CacheFile {
 
 impl std::fmt::Debug for CacheFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CacheFile")
-            .field(
-                "path",
-                &PathBuf::from(self.dir.as_str()).join(filename(self.id)),
-            )
-            .finish()
+        f.debug_struct("CacheFile").field("id", &self.id).finish()
     }
 }
 
@@ -114,18 +108,23 @@ impl CacheFile {
     ///    (b) read header block if exists
     /// 3. read meta blocks to [`DioBuffer`] (TODO)
     /// 4. pre-allocate space
-    pub async fn open(options: CacheFileOptions) -> Result<Self> {
+    pub async fn open(
+        path: impl AsRef<Path>,
+        options: CacheFileOptions,
+    ) -> Result<(CacheFileMeta, Self)> {
         options.assert();
 
+        let id = Self::id(&path)?;
+        let path = path.as_ref().to_owned();
+
         // 1.
-        let path = PathBuf::from(options.dir.as_str()).join(filename(options.id));
         let mut oopts = OpenOptions::new();
         oopts.create(true);
         oopts.read(true);
         oopts.write(true);
         oopts.custom_flags(libc::O_DIRECT);
 
-        let (file, block_size, meta_blocks, len, capacity, _buffer) = asyncify(move || {
+        let (file, block_size, meta_blocks, len, capacity, buffer) = asyncify(move || {
             let file = oopts.open(path)?;
             let fd = file.as_raw_fd();
             let stat = fstat(fd)?;
@@ -180,9 +179,9 @@ impl CacheFile {
         })
         .await?;
 
-        Ok(Self {
-            dir: options.dir,
-            id: options.id,
+        let meta = CacheFileMeta::new(block_size, buffer);
+        let cache_file = Self {
+            id,
 
             fs_block_size: options.fs_block_size,
             block_size,
@@ -194,7 +193,9 @@ impl CacheFile {
                 len: AtomicUsize::new(len),
                 capacity: AtomicUsize::new(capacity),
             }),
-        })
+        };
+
+        Ok((meta, cache_file))
     }
 
     pub async fn append(&self) -> Result<()> {
@@ -247,6 +248,29 @@ impl CacheFile {
     pub fn meta_blocks(&self) -> usize {
         self.meta_blocks
     }
+
+    #[inline(always)]
+    pub fn filename(id: u32) -> String {
+        format!("cf-{:020}", id)
+    }
+
+    fn id(path: impl AsRef<Path>) -> Result<u32> {
+        let filename = path.as_ref().file_name().ok_or(Error::Other(format!(
+            "unable to extract filename: {}",
+            path.as_ref().display()
+        )))?;
+        let filename = filename
+            .to_str()
+            .ok_or(Error::Other(format!("invalid filename: {:?}", filename)))?
+            .to_string();
+        if &filename[..3] != "cf-" {
+            return Err(Error::Other(format!("invalid filename: {:?}", filename)));
+        }
+        let id = filename[3..]
+            .parse()
+            .map_err(|_| Error::Other(format!("invalid filename: {:?}", filename)))?;
+        Ok(id)
+    }
 }
 
 impl CacheFile {
@@ -256,9 +280,95 @@ impl CacheFile {
     }
 }
 
-#[inline(always)]
-fn filename(id: u64) -> String {
-    format!("cf-{:020}", id)
+#[derive(Default, Debug)]
+pub struct SlotInfo {
+    /// sst id
+    pub sst: u64,
+    /// sst block idx
+    pub block: u32,
+    /// block offset of the cache file
+    pub boffset: u32,
+    /// data length in bytes
+    pub len: u32,
+}
+
+impl SlotInfo {
+    /// block count
+    pub fn blen(&self, block_size: u32) -> u32 {
+        utils::u32::align_up(block_size, self.len)
+    }
+
+    pub fn valid(&self) -> bool {
+        self.sst != 0
+    }
+}
+
+// TODO: Use a dirty bitmap to reduce meta update size?
+// IOPS also need to be taken into considerations. With O_DIRECT, scatter-gather I/O doesn't
+// perfrom, which means even with vectored I/O, one `IoSlice` generates one I/O request.
+
+pub struct CacheFileMeta {
+    block_size: usize,
+
+    buffer: DioBuffer,
+
+    /// valid slots bitmap
+    valid: BitVec,
+}
+
+impl CacheFileMeta {
+    pub fn new(block_size: usize, buffer: DioBuffer) -> Self {
+        let blocks = buffer.len() / block_size;
+        let infos_per_block = block_size / SLOT_INFO_SIZE;
+        let slots = blocks * infos_per_block;
+
+        let dirty = bitvec![usize,Lsb0;0;blocks];
+        let mut valid = bitvec![usize,Lsb0;0;slots];
+
+        for slot in 0..slots {
+            let cursor =
+                (slot / infos_per_block) * block_size + (slot % infos_per_block) * SLOT_INFO_SIZE;
+            let sst = (&buffer[cursor..cursor + 8]).get_u64();
+            if sst != 0 {
+                valid.set(slot, true);
+            }
+        }
+
+        Self {
+            block_size,
+            buffer,
+            valid,
+        }
+    }
+
+    pub fn get(&self, slot: u32) -> SlotInfo {
+        let infos_per_block = self.block_size / SLOT_INFO_SIZE;
+        let cursor = (slot as usize / infos_per_block) * self.block_size
+            + (slot as usize % infos_per_block) * SLOT_INFO_SIZE;
+        let buf = &mut &self.buffer[cursor..cursor + SLOT_INFO_SIZE];
+        let sst = buf.get_u64();
+        let block = buf.get_u32();
+        let boffset = buf.get_u32();
+        let len = buf.get_u32();
+        SlotInfo {
+            sst,
+            block,
+            boffset,
+            len,
+        }
+    }
+
+    pub fn set(&mut self, slot: u32, info: &SlotInfo) {
+        let infos_per_block = self.block_size as usize / SLOT_INFO_SIZE;
+        let cursor = (slot as usize / infos_per_block) * self.block_size as usize
+            + (slot as usize % infos_per_block) * SLOT_INFO_SIZE;
+        let mut buf = &mut self.buffer[cursor..cursor + SLOT_INFO_SIZE];
+        buf.put_u64(info.sst);
+        buf.put_u32(info.block);
+        buf.put_u32(info.boffset);
+        buf.put_u32(info.len);
+        self.valid.set(slot as usize, info.sst != 0);
+    }
 }
 
 fn write_header(file: &File, block_size: usize, meta_blocks: usize) -> Result<()> {
@@ -304,26 +414,6 @@ fn read_header(file: &File) -> Result<(usize, usize)> {
     Ok((block_size, meta_blocks))
 }
 
-#[inline(always)]
-fn assert_pow2(v: usize) {
-    assert_eq!(v & (v - 1), 0);
-}
-
-#[inline(always)]
-fn assert_alignment(align: usize, v: usize) {
-    assert_eq!(v & (align - 1), 0, "align: {}, v: {}", align, v);
-}
-
-#[inline(always)]
-fn _align_up(align: usize, v: usize) -> usize {
-    (v + align - 1) & !(align - 1)
-}
-
-#[inline(always)]
-fn _align_down(align: usize, v: usize) -> usize {
-    v & !(align - 1)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -338,23 +428,21 @@ mod tests {
     #[tokio::test]
     async fn test_file_cache() {
         let tempdir = tempfile::tempdir().unwrap();
+        let path = tempdir.path().join(CacheFile::filename(1));
         let options = CacheFileOptions {
-            dir: tempdir.path().to_str().unwrap().to_string(),
-            id: 1,
-
             fs_block_size: 4096,
             block_size: 4096,
             meta_blocks: 64,
             fallocate_unit: 64 * 1024 * 1024,
         };
-        let cf = CacheFile::open(options.clone()).await.unwrap();
+        let (_meta, cf) = CacheFile::open(&path, options.clone()).await.unwrap();
         assert_eq!(cf.block_size, 4096);
         assert_eq!(cf.meta_blocks, 64);
         assert_eq!(cf.len(), 4096 * 65);
         assert_eq!(cf.size(), 64 * 1024 * 1024);
         drop(cf);
 
-        let cf = CacheFile::open(options).await.unwrap();
+        let (_meta, cf) = CacheFile::open(&path, options).await.unwrap();
         assert_eq!(cf.block_size, 4096);
         assert_eq!(cf.meta_blocks, 64);
         assert_eq!(cf.len(), 4096 * 65);

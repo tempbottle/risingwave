@@ -12,58 +12,48 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use nix::sys::statfs::{statfs, FsType as NixFsType, EXT4_SUPER_MAGIC};
+use risingwave_common::cache::LruCache;
 
-use super::error::{Error, Result};
+use super::cache_file_manager::{CacheFileManager, CacheFileManagerOptions, CacheFileManagerRef};
+use super::error::Result;
 use super::filter::Filter;
+use super::index::{IndexKey, IndexValue};
 
-#[derive(Clone, Copy, Debug)]
-pub enum FsType {
-    Ext4,
-    Xfs,
-}
-
-pub struct FileCacheManagerOptions {
+pub struct FileCacheOptions {
     pub dir: String,
+    pub capacity: usize,
     pub filters: Vec<Arc<dyn Filter>>,
 }
 
 #[derive(Clone)]
-pub struct FileCacheManager {
-    _dir: String,
-
-    _fs_type: FsType,
-    _fs_block_size: usize,
-
+pub struct FileCache {
     _filters: Vec<Arc<dyn Filter>>,
+
+    _indices: Arc<LruCache<IndexKey, IndexValue>>,
+
+    _cache_file_manager: CacheFileManagerRef,
 }
 
-impl FileCacheManager {
-    pub async fn open(options: FileCacheManagerOptions) -> Result<Self> {
-        if !PathBuf::from(options.dir.as_str()).exists() {
-            std::fs::create_dir_all(options.dir.as_str())?;
-        }
+impl FileCache {
+    pub async fn open(options: FileCacheOptions) -> Result<Self> {
+        let cache_file_manager =
+            CacheFileManager::open(CacheFileManagerOptions { dir: options.dir })?;
+        let cache_file_manager = Arc::new(cache_file_manager);
 
-        // Get file system type and block size by `statfs(2)`.
-        let fs_stat = statfs(options.dir.as_str())?;
-        let fs_type = match fs_stat.filesystem_type() {
-            EXT4_SUPER_MAGIC => FsType::Ext4,
-            // FYI: https://github.com/nix-rust/nix/issues/1742
-            NixFsType(libc::XFS_SUPER_MAGIC) => FsType::Xfs,
-            nix_fs_type => return Err(Error::UnsupportedFilesystem(nix_fs_type.0)),
-        };
-        let fs_block_size = fs_stat.block_size() as usize;
+        // TODO: Restore indices.
+        let indices =
+            LruCache::with_event_listeners(6, options.capacity, vec![cache_file_manager.clone()]);
+        cache_file_manager.restore(&indices).await?;
+        let indices = Arc::new(indices);
 
         Ok(Self {
-            _dir: options.dir,
-
-            _fs_type: fs_type,
-            _fs_block_size: fs_block_size,
-
             _filters: options.filters,
+
+            _indices: indices,
+
+            _cache_file_manager: cache_file_manager,
         })
     }
 }
@@ -77,7 +67,7 @@ mod tests {
 
     #[test]
     fn ensure_send_sync_clone() {
-        is_send_sync_clone::<FileCacheManager>();
+        is_send_sync_clone::<FileCache>();
     }
 
     #[tokio::test]
@@ -93,10 +83,11 @@ mod tests {
             tempfile::tempdir().unwrap()
         };
 
-        let options = FileCacheManagerOptions {
+        let options = FileCacheOptions {
             dir: tempdir.path().to_str().unwrap().to_string(),
+            capacity: 256 * 1024 * 1024, // 256 MiB
             filters: vec![],
         };
-        let _manager = FileCacheManager::open(options).await.unwrap();
+        let _manager = FileCache::open(options).await.unwrap();
     }
 }
