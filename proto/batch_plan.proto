@@ -104,6 +104,13 @@ message HashAggNode {
   repeated expr.AggCall agg_calls = 2;
 }
 
+message ExpandNode {
+  message Keys {
+    repeated uint32 keys = 1;
+  }
+  repeated Keys expanded_keys = 1;
+}
+
 message SortAggNode {
   repeated expr.ExprNode group_keys = 1;
   repeated expr.AggCall agg_calls = 2;
@@ -204,6 +211,7 @@ message PlanNode {
     SortMergeJoinNode sort_merge_join = 22;
     HopWindowNode hop_window = 25;
     TableFunctionNode table_function = 26;
+    ExpandNode expand = 27;
   }
   string identity = 24;
 }
