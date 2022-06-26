@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use futures::Future;
 use risingwave_hummock_sdk::key::{Epoch, FullKey};
 use risingwave_hummock_sdk::HummockSSTableId;
@@ -45,6 +48,8 @@ pub struct CapacitySplitTableBuilder<B> {
     current_builder: Option<SSTableBuilder>,
 
     sstable_store: SstableStoreRef,
+
+    uploading_size: Arc<AtomicUsize>,
 }
 
 impl<B, F> CapacitySplitTableBuilder<B>
@@ -59,6 +64,7 @@ where
             sealed_builders: Vec::new(),
             current_builder: None,
             sstable_store,
+            uploading_size: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -126,10 +132,12 @@ where
         if let Some(builder) = self.current_builder.take() {
             let (table_id, data, meta, table_ids) = builder.finish();
             let len = data.len();
+            self.uploading_size.fetch_add(len, Ordering::Relaxed);
             let sstable_store = self.sstable_store.clone();
             let meta_clone = meta.clone();
+            let uploading_size = self.uploading_size.clone();
             let upload_join_handle = tokio::spawn(async move {
-                sstable_store
+                let ret = sstable_store
                     .put(
                         Sstable {
                             id: table_id,
@@ -138,7 +146,9 @@ where
                         data,
                         CachePolicy::Fill,
                     )
-                    .await
+                    .await;
+                uploading_size.fetch_sub(len, Ordering::Relaxed);
+                ret
             });
             self.sealed_builders.push(SealedSstableBuilder {
                 id: table_id,
